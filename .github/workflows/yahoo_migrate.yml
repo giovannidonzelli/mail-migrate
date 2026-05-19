@@ -6,16 +6,17 @@ on:
     # IT 08:00-18:00 (UTC 06:00-16:00) → ogni 7 minuti  [GIORNO]
     - cron: '*/7 6-16 * * *'
     # IT 06:00-08:00 (UTC 04:00-06:00) → ogni 15 minuti [ALBA]
-    # IT 18:00-23:00 (UTC 16:00-21:00) → ogni 15 minuti [SERA]
     - cron: '*/15 4-6  * * *'
+    # IT 18:00-23:00 (UTC 16:00-21:00) → ogni 15 minuti [SERA]
     - cron: '*/15 16-21 * * *'
     # IT 23:00-02:00 (UTC 21:00-00:00) → ogni 30 minuti [PRIMA NOTTE]
     - cron: '0,30 21-23 * * *'
-    # IT 00:00-02:00 (UTC 22:00-00:00) già coperto sopra
     # IT 02:00-06:00 (UTC 00:00-04:00) → ogni 3 ore     [NOTTE FONDA]
     - cron: '0 0,3  * * *'
+    # ── NOTIFICA GIORNALIERA ─────────────────────────────────────────────────
+    # IT 20:00 (UTC 18:00) → report errori giornaliero
+    - cron: '0 18 * * *'
     # ── HEARTBEAT ────────────────────────────────────────────────────────────
-    # Il 1° di ogni mese alle 08:00 UTC (mantiene workflow attivo)
     - cron: '0 8 1 * *'
   workflow_dispatch:
 
@@ -26,7 +27,9 @@ jobs:
   migrate:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event.schedule != '0 8 1 * *'
+    if: |
+      github.event.schedule != '0 8 1 * *' &&
+      github.event.schedule != '0 18 * * *'
 
     steps:
       - name: Checkout repository
@@ -38,17 +41,89 @@ jobs:
           python-version: '3.12'
 
       - name: Migra posta Yahoo → Etik
+        id: migrate
         env:
           YAHOO_USER: ${{ secrets.YAHOO_USER }}
           YAHOO_PASS: ${{ secrets.YAHOO_PASS }}
           ETIK_USER:  ${{ secrets.ETIK_USER }}
           ETIK_PASS:  ${{ secrets.ETIK_PASS }}
-        run: python yahoo_to_etik.py
+        run: python yahoo_to_etik.py 2>&1 | tee run.log
 
-      - name: Notifica in caso di errore
+      - name: Registra errori del giorno
         if: failure()
         run: |
-          echo "::error::Migrazione fallita — controlla i log sopra"
+          git config user.name  "mail-migrate-bot"
+          git config user.email "bot@noreply.github.com"
+          echo "$(date -u '+%Y-%m-%d %H:%M UTC') — errori nel run" >> errors.log
+          git add errors.log
+          git diff --cached --quiet || git commit -m "log errore $(date -u '+%Y-%m-%d %H:%M')"
+          git push
+
+  notify:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 18 * * *'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Invia report errori se presenti
+        env:
+          ETIK_USER: ${{ secrets.ETIK_USER }}
+          ETIK_PASS: ${{ secrets.ETIK_PASS }}
+        run: |
+          if [ ! -f errors.log ] || [ ! -s errors.log ]; then
+            echo "Nessun errore oggi — nessuna email inviata."
+            exit 0
+          fi
+
+          ERRORI=$(cat errors.log)
+          python3 - << PYEOF
+          import smtplib, os
+          from email.mime.text import MIMEText
+          from datetime import date
+
+          user = os.environ["ETIK_USER"]
+          pwd  = os.environ["ETIK_PASS"]
+          oggi = date.today().strftime("%d/%m/%Y")
+
+          corpo = f"""Buonasera,
+
+          Il sistema di migrazione email Yahoo → Etik ha riscontrato
+          alcuni errori oggi {oggi}.
+
+          Dettagli:
+          {open("errors.log").read()}
+
+          Il sistema continuerà a riprovare automaticamente.
+          Nessuna azione richiesta da parte sua.
+
+          ---
+          Mail Migrate Bot
+          """
+
+          msg = MIMEText(corpo, "plain", "utf-8")
+          msg["Subject"] = f"[Mail Migrate] Errori del {oggi}"
+          msg["From"]    = user
+          msg["To"]      = user
+
+          with smtplib.SMTP_SSL("mail.infomaniak.com", 465) as s:
+              s.login(user, pwd)
+              s.send_message(msg)
+
+          print("Email errori inviata.")
+          PYEOF
+
+      - name: Svuota errors.log dopo invio
+        run: |
+          if [ -f errors.log ] && [ -s errors.log ]; then
+            git config user.name  "mail-migrate-bot"
+            git config user.email "bot@noreply.github.com"
+            > errors.log
+            git add errors.log
+            git commit -m "reset errors.log $(date -u '+%Y-%m-%d')"
+            git push
+          fi
 
   heartbeat:
     runs-on: ubuntu-latest

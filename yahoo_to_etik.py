@@ -2,8 +2,7 @@
 """
 yahoo_to_etik.py
 Sposta la posta in arrivo da Yahoo → Etik (Infomaniak) via IMAP.
-Ogni email viene appended su Etik e poi expunged da Yahoo.
-Sicuro: nessun SMTP, nessun relay. Solo IMAP append.
+Usa UID invece di sequence number — stabile anche dopo expunge mid-run.
 
 Variabili d'ambiente richieste (GitHub Secrets):
   YAHOO_USER       es. gvadonzelli@yahoo.it
@@ -57,55 +56,6 @@ def connect_imap(host: str, port: int, user: str, password: str) -> imaplib.IMAP
     return conn
 
 
-def fetch_email(yahoo: imaplib.IMAP4_SSL, msg_id: bytes):
-    """
-    Fetch robusto — gestisce le varianti di risposta Yahoo.
-    Ritorna (raw_email, internal_date) oppure (None, None) se fallisce.
-    """
-    try:
-        status, msg_data = yahoo.fetch(msg_id, "(RFC822 INTERNALDATE)")
-        if status != "OK":
-            log.warning(f"  Fetch status non OK per msg {msg_id}: {status}")
-            return None, None
-
-        if not msg_data or msg_data[0] is None:
-            log.warning(f"  msg_data vuoto per msg {msg_id} — DEBUG: {repr(msg_data)}")
-            return None, None
-
-        # Yahoo a volte restituisce strutture diverse — cerchiamo RFC822 in tutti i blocchi
-        raw_email = None
-        internal_date = None
-
-        for part in msg_data:
-            if part is None:
-                continue
-            # Blocco tupla: (header_bytes, body_bytes)
-            if isinstance(part, tuple):
-                header = part[0] if part[0] else b""
-                body   = part[1] if len(part) > 1 else None
-
-                if body and isinstance(body, bytes) and len(body) > 0:
-                    raw_email = body
-
-                # Estrai INTERNALDATE dall'header
-                if header and b"INTERNALDATE" in header:
-                    try:
-                        internal_date = imaplib.Internaldate2tuple(header)
-                    except Exception as e:
-                        log.warning(f"  Parsing INTERNALDATE fallito: {e}")
-                        internal_date = None
-
-        if raw_email is None:
-            log.warning(f"  raw_email None per msg {msg_id} — struttura completa: {repr(msg_data)}")
-            return None, None
-
-        return raw_email, internal_date
-
-    except Exception as e:
-        log.error(f"  Eccezione fetch msg {msg_id}: {e}")
-        return None, None
-
-
 def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
     stats = {"fetched": 0, "appended": 0, "deleted": 0, "errors": 0, "skipped": 0}
 
@@ -121,23 +71,57 @@ def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
         log.info("Nessun messaggio da migrare.")
         return stats
 
-    status, msg_ids_raw = yahoo.search(None, "NOT DELETED")
+    # UID SEARCH — UID stabili, non cambiano dopo expunge
+    status, uid_data = yahoo.uid("SEARCH", "NOT DELETED")
     if status != "OK":
-        log.error("Ricerca messaggi fallita")
+        log.error("UID SEARCH fallita")
         return stats
 
-    msg_ids = msg_ids_raw[0].split()
-    log.info(f"Messaggi da migrare: {len(msg_ids)} (batch max {BATCH_SIZE})")
+    uids = uid_data[0].split()
+    log.info(f"Messaggi da migrare: {len(uids)} (batch max {BATCH_SIZE})")
 
-    batch = msg_ids[:BATCH_SIZE]
+    batch = uids[:BATCH_SIZE]
 
-    for msg_id in batch:
+    for uid in batch:
+        uid_str = uid.decode()
         try:
-            # 1. Fetch robusto
-            raw_email, internal_date = fetch_email(yahoo, msg_id)
+            # 1. UID FETCH — usa UID, non sequence number
+            status, msg_data = yahoo.uid("FETCH", uid, "(RFC822 INTERNALDATE)")
+
+            if status != "OK":
+                log.warning(f"  UID FETCH status non OK per uid {uid_str}: {status}")
+                stats["skipped"] += 1
+                stats["errors"] += 1
+                continue
+
+            if not msg_data or msg_data[0] is None:
+                log.warning(f"  msg_data vuoto per uid {uid_str}")
+                stats["skipped"] += 1
+                stats["errors"] += 1
+                continue
+
+            # Estrai raw_email e internal_date dalla risposta
+            raw_email = None
+            internal_date = None
+
+            for part in msg_data:
+                if part is None:
+                    continue
+                if isinstance(part, tuple):
+                    header = part[0] if part[0] else b""
+                    body   = part[1] if len(part) > 1 else None
+
+                    if body and isinstance(body, bytes) and len(body) > 0:
+                        raw_email = body
+
+                    if header and b"INTERNALDATE" in header:
+                        try:
+                            internal_date = imaplib.Internaldate2tuple(header)
+                        except Exception as e:
+                            log.warning(f"  Parsing INTERNALDATE fallito: {e}")
 
             if raw_email is None:
-                log.warning(f"  Skipping msg {msg_id} — fetch fallito")
+                log.warning(f"  raw_email None per uid {uid_str} — struttura: {repr(msg_data)}")
                 stats["skipped"] += 1
                 stats["errors"] += 1
                 continue
@@ -152,25 +136,25 @@ def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
                 raw_email
             )
             if status != "OK":
-                log.warning(f"  Append fallito per msg {msg_id}: {append_data}")
+                log.warning(f"  Append fallito per uid {uid_str}: {append_data}")
                 stats["errors"] += 1
                 continue
 
             stats["appended"] += 1
-            log.info(f"  ✓ Migrata msg {msg_id.decode()} → Etik")
+            log.info(f"  ✓ Migrata uid {uid_str} → Etik")
 
-            # 3. Cancella da Yahoo solo se append OK
-            yahoo.store(msg_id, "+FLAGS", "\\Deleted")
+            # 3. UID STORE — cancella con UID, non sequence number
+            yahoo.uid("STORE", uid, "+FLAGS", "\\Deleted")
             stats["deleted"] += 1
 
             time.sleep(SLEEP_MS / 1000)
 
         except Exception as e:
-            log.error(f"Errore su msg {msg_id}: {e}")
+            log.error(f"Errore su uid {uid_str}: {e}")
             stats["errors"] += 1
             continue
 
-    # 4. Expunge
+    # 4. Expunge una sola volta alla fine
     if stats["deleted"] > 0:
         log.info("Expunge Yahoo INBOX...")
         yahoo.expunge()

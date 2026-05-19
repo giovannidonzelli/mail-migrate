@@ -1,0 +1,68 @@
+name: Yahoo → Etik IMAP Migrator
+
+on:
+  schedule:
+    # ── ELASTICO (ora italiana → UTC) ────────────────────────────────────────
+    # IT 08:00-18:00 (UTC 06:00-16:00) → ogni 7 minuti  [GIORNO]
+    - cron: '*/7 6-16 * * *'
+    # IT 06:00-08:00 (UTC 04:00-06:00) → ogni 15 minuti [ALBA]
+    # IT 18:00-23:00 (UTC 16:00-21:00) → ogni 15 minuti [SERA]
+    - cron: '*/15 4-6  * * *'
+    - cron: '*/15 16-21 * * *'
+    # IT 23:00-02:00 (UTC 21:00-00:00) → ogni 30 minuti [PRIMA NOTTE]
+    - cron: '0,30 21-23 * * *'
+    # IT 00:00-02:00 (UTC 22:00-00:00) già coperto sopra
+    # IT 02:00-06:00 (UTC 00:00-04:00) → ogni 3 ore     [NOTTE FONDA]
+    - cron: '0 0,3  * * *'
+    # ── HEARTBEAT ────────────────────────────────────────────────────────────
+    # Il 1° di ogni mese alle 08:00 UTC (mantiene workflow attivo)
+    - cron: '0 8 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.schedule != '0 8 1 * *'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Migra posta Yahoo → Etik
+        env:
+          YAHOO_USER: ${{ secrets.YAHOO_USER }}
+          YAHOO_PASS: ${{ secrets.YAHOO_PASS }}
+          ETIK_USER:  ${{ secrets.ETIK_USER }}
+          ETIK_PASS:  ${{ secrets.ETIK_PASS }}
+        run: python yahoo_to_etik.py
+
+      - name: Notifica in caso di errore
+        if: failure()
+        run: |
+          echo "::error::Migrazione fallita — controlla i log sopra"
+
+  heartbeat:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 8 1 * *'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Commit heartbeat
+        run: |
+          git config user.name  "mail-migrate-bot"
+          git config user.email "bot@noreply.github.com"
+          echo "heartbeat: $(date -u '+%Y-%m-%d')" > heartbeat.txt
+          git add heartbeat.txt
+          git commit -m "heartbeat $(date -u '+%Y-%m')"
+          git push

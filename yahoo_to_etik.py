@@ -6,7 +6,7 @@ Ogni email viene appended su Etik e poi expunged da Yahoo.
 Sicuro: nessun SMTP, nessun relay. Solo IMAP append.
 
 Variabili d'ambiente richieste (GitHub Secrets):
-  YAHOO_USER       es. giuseppe.donzelli@yahoo.it
+  YAHOO_USER       es. gvadonzelli@yahoo.it
   YAHOO_PASS       App Password Yahoo (16 caratteri)
   ETIK_USER        es. giuseppe.donzelli@etik.com
   ETIK_PASS        Password Infomaniak
@@ -18,9 +18,7 @@ import imaplib
 import os
 import sys
 import time
-import email
 import logging
-from datetime import datetime
 
 # ── Configurazione ──────────────────────────────────────────────────────────
 YAHOO_HOST  = "imap.mail.yahoo.com"
@@ -31,8 +29,8 @@ ETIK_HOST   = "mail.infomaniak.com"
 ETIK_PORT   = 993
 ETIK_INBOX  = "INBOX"
 
-BATCH_SIZE  = 50   # email per run (sicuro contro timeout GitHub Actions)
-SLEEP_MS    = 200  # ms tra un append e l'altro (gentile col server)
+BATCH_SIZE  = 50
+SLEEP_MS    = 300
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -59,10 +57,58 @@ def connect_imap(host: str, port: int, user: str, password: str) -> imaplib.IMAP
     return conn
 
 
-def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
-    stats = {"fetched": 0, "appended": 0, "deleted": 0, "errors": 0}
+def fetch_email(yahoo: imaplib.IMAP4_SSL, msg_id: bytes):
+    """
+    Fetch robusto — gestisce le varianti di risposta Yahoo.
+    Ritorna (raw_email, internal_date) oppure (None, None) se fallisce.
+    """
+    try:
+        status, msg_data = yahoo.fetch(msg_id, "(RFC822 INTERNALDATE)")
+        if status != "OK":
+            log.warning(f"  Fetch status non OK per msg {msg_id}: {status}")
+            return None, None
 
-    # Seleziona INBOX Yahoo (read-write per poter cancellare)
+        if not msg_data or msg_data[0] is None:
+            log.warning(f"  msg_data vuoto per msg {msg_id} — DEBUG: {repr(msg_data)}")
+            return None, None
+
+        # Yahoo a volte restituisce strutture diverse — cerchiamo RFC822 in tutti i blocchi
+        raw_email = None
+        internal_date = None
+
+        for part in msg_data:
+            if part is None:
+                continue
+            # Blocco tupla: (header_bytes, body_bytes)
+            if isinstance(part, tuple):
+                header = part[0] if part[0] else b""
+                body   = part[1] if len(part) > 1 else None
+
+                if body and isinstance(body, bytes) and len(body) > 0:
+                    raw_email = body
+
+                # Estrai INTERNALDATE dall'header
+                if header and b"INTERNALDATE" in header:
+                    try:
+                        internal_date = imaplib.Internaldate2tuple(header)
+                    except Exception as e:
+                        log.warning(f"  Parsing INTERNALDATE fallito: {e}")
+                        internal_date = None
+
+        if raw_email is None:
+            log.warning(f"  raw_email None per msg {msg_id} — struttura completa: {repr(msg_data)}")
+            return None, None
+
+        return raw_email, internal_date
+
+    except Exception as e:
+        log.error(f"  Eccezione fetch msg {msg_id}: {e}")
+        return None, None
+
+
+def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
+    stats = {"fetched": 0, "appended": 0, "deleted": 0, "errors": 0, "skipped": 0}
+
     status, data = yahoo.select(YAHOO_INBOX)
     if status != "OK":
         log.error(f"Impossibile selezionare INBOX Yahoo: {data}")
@@ -75,7 +121,6 @@ def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
         log.info("Nessun messaggio da migrare.")
         return stats
 
-    # Cerca tutti i messaggi non cancellati
     status, msg_ids_raw = yahoo.search(None, "NOT DELETED")
     if status != "OK":
         log.error("Ricerca messaggi fallita")
@@ -84,40 +129,37 @@ def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
     msg_ids = msg_ids_raw[0].split()
     log.info(f"Messaggi da migrare: {len(msg_ids)} (batch max {BATCH_SIZE})")
 
-    # Prende solo il batch corrente
     batch = msg_ids[:BATCH_SIZE]
 
     for msg_id in batch:
         try:
-            # 1. Fetch email completa (RFC822 = raw bytes)
-            status, msg_data = yahoo.fetch(msg_id, "(RFC822 INTERNALDATE)")
-            if status != "OK":
-                log.warning(f"Fetch fallito per msg {msg_id}")
+            # 1. Fetch robusto
+            raw_email, internal_date = fetch_email(yahoo, msg_id)
+
+            if raw_email is None:
+                log.warning(f"  Skipping msg {msg_id} — fetch fallito")
+                stats["skipped"] += 1
                 stats["errors"] += 1
                 continue
 
-            raw_email = msg_data[0][1]
-            # Prende la data originale per preservarla su Etik
-            internal_date_str = msg_data[0][0].decode()
-            internal_date = imaplib.Internaldate2tuple(msg_data[0][0])
             stats["fetched"] += 1
 
-            # 2. Append su Etik con data originale
+            # 2. Append su Etik
             status, append_data = etik.append(
                 ETIK_INBOX,
-                None,           # flags (nessuno — arriva come non letto)
-                internal_date,  # data originale preservata
+                None,
+                internal_date,
                 raw_email
             )
             if status != "OK":
-                log.warning(f"Append fallito per msg {msg_id}: {append_data}")
+                log.warning(f"  Append fallito per msg {msg_id}: {append_data}")
                 stats["errors"] += 1
                 continue
 
             stats["appended"] += 1
             log.info(f"  ✓ Migrata msg {msg_id.decode()} → Etik")
 
-            # 3. Marca come \Deleted su Yahoo
+            # 3. Cancella da Yahoo solo se append OK
             yahoo.store(msg_id, "+FLAGS", "\\Deleted")
             stats["deleted"] += 1
 
@@ -128,7 +170,7 @@ def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
             stats["errors"] += 1
             continue
 
-    # 4. Expunge: rimuove definitivamente i messaggi marcati \Deleted
+    # 4. Expunge
     if stats["deleted"] > 0:
         log.info("Expunge Yahoo INBOX...")
         yahoo.expunge()
@@ -157,11 +199,15 @@ def main():
         log.info(f"  Recuperate da Yahoo : {stats['fetched']}")
         log.info(f"  Copiate su Etik     : {stats['appended']}")
         log.info(f"  Cancellate da Yahoo : {stats['deleted']}")
+        log.info(f"  Skippate            : {stats['skipped']}")
         log.info(f"  Errori              : {stats['errors']}")
         log.info("─" * 50)
 
-        if stats["errors"] > 0:
-            sys.exit(1)  # Fa fallire il GitHub Actions run → notifica
+        # Exit 1 solo se errori > 20% del totale processato
+        totale = stats["fetched"] + stats["skipped"]
+        if totale > 0 and stats["errors"] / totale > 0.20:
+            log.error("Troppi errori (>20%) — exit 1")
+            sys.exit(1)
 
     finally:
         for conn in [yahoo, etik]:

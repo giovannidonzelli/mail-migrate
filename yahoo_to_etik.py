@@ -1,206 +1,128 @@
-#!/usr/bin/env python3
-"""
-yahoo_to_etik.py
-Sposta la posta in arrivo da Yahoo → Etik (Infomaniak) via IMAP.
-Usa UID invece di sequence number — stabile anche dopo expunge mid-run.
+name: Yahoo → Etik IMAP Migrator
 
-Variabili d'ambiente richieste (GitHub Secrets):
-  YAHOO_USER       es. gvadonzelli@yahoo.it
-  YAHOO_PASS       App Password Yahoo (16 caratteri)
-  ETIK_USER        es. giuseppe.donzelli@etik.com
-  ETIK_PASS        Password Infomaniak
+on:
+  # Triggerato da cron-job.org via API workflow_dispatch
+  workflow_dispatch:
 
-Autore: Claude (Polpettone) per Eagle Hack Lab / SimpleMachines.it
-"""
+permissions:
+  contents: write
 
-import imaplib
-import os
-import sys
-import time
-import logging
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-# ── Configurazione ──────────────────────────────────────────────────────────
-YAHOO_HOST  = "imap.mail.yahoo.com"
-YAHOO_PORT  = 993
-YAHOO_INBOX = "INBOX"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-ETIK_HOST   = "mail.infomaniak.com"
-ETIK_PORT   = 993
-ETIK_INBOX  = "INBOX"
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
-BATCH_SIZE  = 50
-SLEEP_MS    = 300
+      - name: Migra posta Yahoo → Etik (tutti gli utenti)
+        env:
+          # Utente base — Donzelli (secrets originali invariati)
+          YAHOO_USER: ${{ secrets.YAHOO_USER }}
+          YAHOO_PASS: ${{ secrets.YAHOO_PASS }}
+          ETIK_USER:  ${{ secrets.ETIK_USER }}
+          ETIK_PASS:  ${{ secrets.ETIK_PASS }}
+          # Utente 2 — Moglie
+          YAHOO_USER_2: ${{ secrets.YAHOO_USER_2 }}
+          YAHOO_PASS_2: ${{ secrets.YAHOO_PASS_2 }}
+          ETIK_USER_2:  ${{ secrets.ETIK_USER_2 }}
+          ETIK_PASS_2:  ${{ secrets.ETIK_PASS_2 }}
+          # Utente N — aggiungere qui seguendo lo stesso schema _N
+        run: python yahoo_to_etik.py
 
-# ── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger(__name__)
+      - name: Registra errori del giorno
+        if: failure()
+        run: |
+          git config user.name  "mail-migrate-bot"
+          git config user.email "bot@noreply.github.com"
+          echo "$(date -u '+%Y-%m-%d %H:%M UTC') — errori nel run" >> errors.log
+          git add errors.log
+          git diff --cached --quiet || git commit -m "log errore $(date -u '+%Y-%m-%d %H:%M')"
+          git push
 
+  notify:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.notify == 'true'
 
-def get_env(name: str) -> str:
-    val = os.environ.get(name, "").strip()
-    if not val:
-        log.error(f"Variabile d'ambiente mancante: {name}")
-        sys.exit(1)
-    return val
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
+      - name: Invia report errori se presenti
+        env:
+          ETIK_USER: ${{ secrets.ETIK_USER }}
+          ETIK_PASS: ${{ secrets.ETIK_PASS }}
+        run: |
+          if [ ! -f errors.log ] || [ ! -s errors.log ]; then
+            echo "Nessun errore oggi — nessuna email inviata."
+            exit 0
+          fi
 
-def connect_imap(host: str, port: int, user: str, password: str) -> imaplib.IMAP4_SSL:
-    log.info(f"Connessione IMAP → {host}:{port} come {user}")
-    conn = imaplib.IMAP4_SSL(host, port)
-    conn.login(user, password)
-    log.info(f"Login OK: {user}")
-    return conn
+          python3 - << PYEOF
+          import smtplib, os
+          from email.mime.text import MIMEText
+          from datetime import date
 
+          user = os.environ["ETIK_USER"]
+          pwd  = os.environ["ETIK_PASS"]
+          oggi = date.today().strftime("%d/%m/%Y")
 
-def migrate(yahoo: imaplib.IMAP4_SSL, etik: imaplib.IMAP4_SSL) -> dict:
-    stats = {"fetched": 0, "appended": 0, "deleted": 0, "errors": 0, "skipped": 0}
+          corpo = f"""Buonasera,
 
-    status, data = yahoo.select(YAHOO_INBOX)
-    if status != "OK":
-        log.error(f"Impossibile selezionare INBOX Yahoo: {data}")
-        return stats
+          Il sistema di migrazione email Yahoo → Etik ha riscontrato
+          alcuni errori oggi {oggi}.
 
-    total_msgs = int(data[0])
-    log.info(f"Yahoo INBOX: {total_msgs} messaggi totali")
+          Dettagli:
+          {open("errors.log").read()}
 
-    if total_msgs == 0:
-        log.info("Nessun messaggio da migrare.")
-        return stats
+          Il sistema continuerà a riprovare automaticamente.
+          Nessuna azione richiesta da parte sua.
 
-    # UID SEARCH — UID stabili, non cambiano dopo expunge
-    status, uid_data = yahoo.uid("SEARCH", "NOT DELETED")
-    if status != "OK":
-        log.error("UID SEARCH fallita")
-        return stats
+          ---
+          Mail Migrate Bot
+          """
 
-    uids = uid_data[0].split()
-    log.info(f"Messaggi da migrare: {len(uids)} (batch max {BATCH_SIZE})")
+          msg = MIMEText(corpo, "plain", "utf-8")
+          msg["Subject"] = f"[Mail Migrate] Errori del {oggi}"
+          msg["From"]    = user
+          msg["To"]      = user
 
-    batch = uids[:BATCH_SIZE]
+          with smtplib.SMTP_SSL("mail.infomaniak.com", 465) as s:
+              s.login(user, pwd)
+              s.send_message(msg)
+          print("Email errori inviata.")
+          PYEOF
 
-    for uid in batch:
-        uid_str = uid.decode()
-        try:
-            # 1. UID FETCH — usa UID, non sequence number
-            status, msg_data = yahoo.uid("FETCH", uid, "(RFC822 INTERNALDATE)")
+      - name: Svuota errors.log dopo invio
+        run: |
+          if [ -f errors.log ] && [ -s errors.log ]; then
+            git config user.name  "mail-migrate-bot"
+            git config user.email "bot@noreply.github.com"
+            > errors.log
+            git add errors.log
+            git commit -m "reset errors.log $(date -u '+%Y-%m-%d')"
+            git push
+          fi
 
-            if status != "OK":
-                log.warning(f"  UID FETCH status non OK per uid {uid_str}: {status}")
-                stats["skipped"] += 1
-                stats["errors"] += 1
-                continue
+  heartbeat:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.heartbeat == 'true'
 
-            if not msg_data or msg_data[0] is None:
-                log.warning(f"  msg_data vuoto per uid {uid_str}")
-                stats["skipped"] += 1
-                stats["errors"] += 1
-                continue
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-            # Estrai raw_email e internal_date dalla risposta
-            raw_email = None
-            internal_date = None
-
-            for part in msg_data:
-                if part is None:
-                    continue
-                if isinstance(part, tuple):
-                    header = part[0] if part[0] else b""
-                    body   = part[1] if len(part) > 1 else None
-
-                    if body and isinstance(body, bytes) and len(body) > 0:
-                        raw_email = body
-
-                    if header and b"INTERNALDATE" in header:
-                        try:
-                            internal_date = imaplib.Internaldate2tuple(header)
-                        except Exception as e:
-                            log.warning(f"  Parsing INTERNALDATE fallito: {e}")
-
-            if raw_email is None:
-                log.warning(f"  raw_email None per uid {uid_str} — struttura: {repr(msg_data)}")
-                stats["skipped"] += 1
-                stats["errors"] += 1
-                continue
-
-            stats["fetched"] += 1
-
-            # 2. Append su Etik
-            status, append_data = etik.append(
-                ETIK_INBOX,
-                None,
-                internal_date,
-                raw_email
-            )
-            if status != "OK":
-                log.warning(f"  Append fallito per uid {uid_str}: {append_data}")
-                stats["errors"] += 1
-                continue
-
-            stats["appended"] += 1
-            log.info(f"  ✓ Migrata uid {uid_str} → Etik")
-
-            # 3. UID STORE — cancella con UID, non sequence number
-            yahoo.uid("STORE", uid, "+FLAGS", "\\Deleted")
-            stats["deleted"] += 1
-
-            time.sleep(SLEEP_MS / 1000)
-
-        except Exception as e:
-            log.error(f"Errore su uid {uid_str}: {e}")
-            stats["errors"] += 1
-            continue
-
-    # 4. Expunge una sola volta alla fine
-    if stats["deleted"] > 0:
-        log.info("Expunge Yahoo INBOX...")
-        yahoo.expunge()
-        log.info("Expunge completato.")
-
-    return stats
-
-
-def main():
-    yahoo_user = get_env("YAHOO_USER")
-    yahoo_pass = get_env("YAHOO_PASS")
-    etik_user  = get_env("ETIK_USER")
-    etik_pass  = get_env("ETIK_PASS")
-
-    yahoo = None
-    etik  = None
-
-    try:
-        yahoo = connect_imap(YAHOO_HOST, YAHOO_PORT, yahoo_user, yahoo_pass)
-        etik  = connect_imap(ETIK_HOST,  ETIK_PORT,  etik_user,  etik_pass)
-
-        stats = migrate(yahoo, etik)
-
-        log.info("─" * 50)
-        log.info(f"RISULTATO:")
-        log.info(f"  Recuperate da Yahoo : {stats['fetched']}")
-        log.info(f"  Copiate su Etik     : {stats['appended']}")
-        log.info(f"  Cancellate da Yahoo : {stats['deleted']}")
-        log.info(f"  Skippate            : {stats['skipped']}")
-        log.info(f"  Errori              : {stats['errors']}")
-        log.info("─" * 50)
-
-        # Exit 1 solo se errori > 20% del totale processato
-        totale = stats["fetched"] + stats["skipped"]
-        if totale > 0 and stats["errors"] / totale > 0.20:
-            log.error("Troppi errori (>20%) — exit 1")
-            sys.exit(1)
-
-    finally:
-        for conn in [yahoo, etik]:
-            if conn:
-                try:
-                    conn.logout()
-                except Exception:
-                    pass
-
-
-if __name__ == "__main__":
-    main()
+      - name: Commit heartbeat
+        run: |
+          git config user.name  "mail-migrate-bot"
+          git config user.email "bot@noreply.github.com"
+          echo "heartbeat: $(date -u '+%Y-%m-%d')" > heartbeat.txt
+          git add heartbeat.txt
+          git commit -m "heartbeat $(date -u '+%Y-%m')"
+          git push

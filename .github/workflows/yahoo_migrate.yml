@@ -1,24 +1,17 @@
 name: Yahoo → Etik IMAP Migrator
 
 on:
-  schedule:
-    # ── ELASTICO (ora italiana → UTC) ────────────────────────────────────────
-    # IT 08:00-18:00 (UTC 06:00-16:00) → ogni 7 minuti  [GIORNO]
-    - cron: '*/7 6-16 * * *'
-    # IT 06:00-08:00 (UTC 04:00-06:00) → ogni 15 minuti [ALBA]
-    - cron: '*/15 4-6  * * *'
-    # IT 18:00-23:00 (UTC 16:00-21:00) → ogni 15 minuti [SERA]
-    - cron: '*/15 16-21 * * *'
-    # IT 23:00-02:00 (UTC 21:00-00:00) → ogni 30 minuti [PRIMA NOTTE]
-    - cron: '0,30 21-23 * * *'
-    # IT 02:00-06:00 (UTC 00:00-04:00) → ogni 3 ore     [NOTTE FONDA]
-    - cron: '0 0,3  * * *'
-    # ── NOTIFICA GIORNALIERA ─────────────────────────────────────────────────
-    # IT 20:00 (UTC 18:00) → report errori giornaliero
-    - cron: '0 18 * * *'
-    # ── HEARTBEAT ────────────────────────────────────────────────────────────
-    - cron: '0 8 1 * *'
+  # Triggerato da cron-job.org via API workflow_dispatch
   workflow_dispatch:
+    inputs:
+      notify:
+        description: "Invia report errori giornaliero (true/false)"
+        required: false
+        default: "false"
+      heartbeat:
+        description: "Commit heartbeat mensile (true/false)"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -27,9 +20,7 @@ jobs:
   migrate:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: |
-      github.event.schedule != '0 8 1 * *' &&
-      github.event.schedule != '0 18 * * *'
+    if: github.event.inputs.notify != 'true' && github.event.inputs.heartbeat != 'true'
 
     steps:
       - name: Checkout repository
@@ -40,14 +31,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Migra posta Yahoo → Etik
-        id: migrate
+      - name: Migra posta Yahoo → Etik (tutti gli utenti)
         env:
+          # Utente base — Donzelli (secrets originali invariati)
           YAHOO_USER: ${{ secrets.YAHOO_USER }}
           YAHOO_PASS: ${{ secrets.YAHOO_PASS }}
           ETIK_USER:  ${{ secrets.ETIK_USER }}
           ETIK_PASS:  ${{ secrets.ETIK_PASS }}
-        run: python yahoo_to_etik.py 2>&1 | tee run.log
+          # Utente 2 — Moglie
+          YAHOO_USER_2: ${{ secrets.YAHOO_USER_2 }}
+          YAHOO_PASS_2: ${{ secrets.YAHOO_PASS_2 }}
+          ETIK_USER_2:  ${{ secrets.ETIK_USER_2 }}
+          ETIK_PASS_2:  ${{ secrets.ETIK_PASS_2 }}
+          # Utente N — aggiungere qui seguendo lo stesso schema _N
+        run: python yahoo_to_etik.py
 
       - name: Registra errori del giorno
         if: failure()
@@ -61,7 +58,7 @@ jobs:
 
   notify:
     runs-on: ubuntu-latest
-    if: github.event.schedule == '0 18 * * *'
+    if: github.event.inputs.notify == 'true'
 
     steps:
       - name: Checkout repository
@@ -77,7 +74,6 @@ jobs:
             exit 0
           fi
 
-          ERRORI=$(cat errors.log)
           python3 - << PYEOF
           import smtplib, os
           from email.mime.text import MIMEText
@@ -110,7 +106,6 @@ jobs:
           with smtplib.SMTP_SSL("mail.infomaniak.com", 465) as s:
               s.login(user, pwd)
               s.send_message(msg)
-
           print("Email errori inviata.")
           PYEOF
 
@@ -127,7 +122,7 @@ jobs:
 
   heartbeat:
     runs-on: ubuntu-latest
-    if: github.event.schedule == '0 8 1 * *'
+    if: github.event.inputs.heartbeat == 'true'
 
     steps:
       - name: Checkout repository

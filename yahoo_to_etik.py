@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Migra posta Yahoo → Etik (tutti gli utenti)
+      - name: Migra posta Yahoo -> Etik (tutti gli utenti)
         env:
           # Utente base — Donzelli (secrets originali invariati)
           YAHOO_USER: ${{ secrets.YAHOO_USER }}
@@ -75,7 +75,7 @@ jobs:
 
           corpo = f"""Buonasera,
 
-          Il sistema di migrazione email Yahoo → Etik ha riscontrato
+          Il sistema di migrazione email Yahoo -> Etik ha riscontrato
           alcuni errori oggi {oggi}.
 
           Dettagli:

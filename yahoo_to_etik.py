@@ -1,4 +1,4 @@
-name: Yahoo → Etik IMAP Migrator
+name: Yahoo -> Etik IMAP Migrator
 
 on:
   # Triggerato da cron-job.org via API workflow_dispatch
